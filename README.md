@@ -34,7 +34,7 @@ Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/<you>/PersistentAVPlayerItem.git", from: "1.0.0"),
+    .package(url: "https://github.com/rifat072/PersistentAVPlayerItem.git", from: "1.0.0"),
 ],
 targets: [
     .target(name: "App", dependencies: ["PersistentAVPlayerItem"]),
