@@ -77,7 +77,7 @@ open class PersistentAVPlayerItem: AVPlayerItem {
         } else {
             asset = AVURLAsset(url: customSchemeURL)
             let box = ItemBox()
-            let loader = ResourceLoader(remoteURL: url, file: file, cache: cache) { event in
+            let loader = ResourceLoader(remoteURL: url, file: file, isComplete: isComplete, cache: cache) { event in
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated { box.item?.handle(event) }
                 }

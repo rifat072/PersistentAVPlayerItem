@@ -29,11 +29,16 @@ final class CacheFile: @unchecked Sendable {
 
     /// Number of player items currently using this file. Open files are never evicted.
     var openCount = 0
-    /// Set while a worker downloads the whole file from a server that ignores `Range`.
-    var isFullDownloadInProgress = false
+    /// Downloads in flight for this file. Loading requests attach to these before
+    /// starting their own, so each byte range is fetched once.
+    var activeDownloads: [SharedDownload] = []
+    /// The download that keeps filling the file, without subscribers, from a server
+    /// that ignores `Range`. At most one per file.
+    var fillDownload: SharedDownload?
 
     private var handle: FileHandle?
     private var unsavedByteCount = 0
+    private var observers: [ObjectIdentifier: () -> Void] = [:]
 
     init(key: String, remoteURL: URL, directory: URL, fileExtension: String, fileExtensionIsReliable: Bool) {
         self.key = key
@@ -118,14 +123,76 @@ final class CacheFile: @unchecked Sendable {
         metadata.lastAccess = Date()
     }
 
+    // MARK: Shared downloads
+
+    /// The in-flight download best placed to serve bytes from `offset`, if any.
+    func joinableDownload(at offset: Int64) -> SharedDownload? {
+        activeDownloads
+            .filter { $0.canServe(offset: offset) }
+            .min { abs($0.networkOffset - offset) < abs($1.networkOffset - offset) }
+    }
+
+    /// Start of the nearest in-flight download beginning after `offset`. A new
+    /// download stops there instead of fetching the same bytes again.
+    func nextDownloadStart(after offset: Int64) -> Int64? {
+        activeDownloads
+            .filter { !$0.isFinished && $0.startOffset > offset }
+            .map(\.startOffset)
+            .min()
+    }
+
+    func startDownload(fetcher: RemoteFetcher, remoteURL: URL, from start: Int64, to end: Int64?, memoryBufferLimit: Int) -> SharedDownload {
+        let download = SharedDownload(file: self, fetcher: fetcher, remoteURL: remoteURL, from: start, to: end, memoryBufferLimit: memoryBufferLimit)
+        activeDownloads.append(download)
+        return download
+    }
+
+    func cancelDownloads() {
+        for download in activeDownloads { download.cancel() }
+        activeDownloads = []
+        fillDownload = nil
+    }
+
+    // MARK: Observers
+
+    /// `handler` is called on `IO.queue` whenever bytes were written to disk,
+    /// whichever player's download wrote them.
+    func addObserver(_ id: ObjectIdentifier, handler: @escaping () -> Void) {
+        observers[id] = handler
+    }
+
+    func removeObserver(_ id: ObjectIdentifier) {
+        observers[id] = nil
+    }
+
+    func notifyObservers() {
+        for handler in observers.values { handler() }
+    }
+
+    // MARK: Persistence
+
     func saveMetadata() {
         unsavedByteCount = 0
+        // Nothing worth remembering yet; don't leave empty entries on disk.
+        guard metadata.contentLength != nil || !metadata.ranges.isEmpty else { return }
         do {
+            try CacheFile.prepareDirectory(directory)
             let data = try JSONEncoder().encode(metadata)
             try data.write(to: metadataURL, options: .atomic)
         } catch {
             // Without metadata the bytes are simply fetched again next time.
         }
+    }
+
+    /// Creates the cache directory on first use and excludes it from iCloud backup.
+    static func prepareDirectory(_ directory: URL) throws {
+        let fileManager = FileManager.default
+        guard !fileManager.fileExists(atPath: directory.path) else { return }
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        var directory = directory
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? directory.setResourceValues(values)
     }
 
     /// Drops all cached bytes but keeps the instance usable by active players.
@@ -148,7 +215,7 @@ final class CacheFile: @unchecked Sendable {
         if let handle { return handle }
         let fileManager = FileManager.default
         if !fileManager.fileExists(atPath: dataURL.path) {
-            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            try CacheFile.prepareDirectory(directory)
             guard fileManager.createFile(atPath: dataURL.path, contents: nil) else {
                 throw CocoaError(.fileWriteUnknown, userInfo: [NSURLErrorKey: dataURL])
             }

@@ -23,6 +23,7 @@ There's nothing else to set up. What happens depends on how much of the file is 
 
 - **Low memory use.** Each stream holds at most `memoryBufferLimit` bytes (256 KB by default) in RAM, then writes them to a sparse file on disk. Memory use doesn't grow with file size or with the number of bytes downloaded.
 - **Range-aware.** It honors `requestedOffset`, `requestedLength` and `requestsAllDataToEndOfResource`, serves concurrent and out-of-order requests (such as the tail read for an MP4's `moov` atom), and supports seeking into parts that aren't downloaded yet without waiting for earlier bytes.
+- **One download per URL.** Players showing the same URL share in-flight downloads. A player that needs bytes another one is already fetching attaches to that download, catching up from its buffer, instead of opening a second connection. Progress and completion are reported to every item using the URL.
 - **Works on the Simulator.** Content information is filled in properly: a UTI derived from the MIME type or file extension, the total length from `Content-Range`, and byte-range support. Every loading request gets an answer, including requests that only ask for content information.
 - **Servers that ignore `Range`.** If a server replies `200` with the whole file, the bytes before the requested offset are skipped for playback but still written to the cache.
 - **Persistent.** Files live in `Documents/PersistentAVPlayerItem/`, which is excluded from iCloud backup. A JSON file next to each media file records which byte ranges are valid, so caching resumes across launches.
@@ -106,7 +107,7 @@ The library keeps its own memory small. Most of the remaining memory goes to AVF
 - **Pause tiles that are off screen** (`onDisappear`), and release players you no longer show.
 - **Use `AVPlayerLayer`** instead of SwiftUI's `VideoPlayer`, which adds playback controls to every tile.
 - **Mute and use the `.ambient` audio session category** so background videos don't interrupt the user's music.
-- **To loop**, observe `AVPlayerItem.didPlayToEndTimeNotification` and seek to zero. `AVPlayerLooper` also works, because copies of a `PersistentAVPlayerItem` keep caching, but each copy opens its own loader.
+- **To loop**, observe `AVPlayerItem.didPlayToEndTimeNotification` and seek to zero. `AVPlayerLooper` also works: copies of a `PersistentAVPlayerItem` keep caching and share downloads with the original.
 
 ## Demo
 

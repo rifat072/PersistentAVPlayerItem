@@ -10,6 +10,31 @@ final class StubServer: @unchecked Sendable {
         var data: Data
         var mimeType: String
         var supportsRange: Bool
+        /// Pauses the first response after this many body bytes until opened.
+        var gate: Gate?
+    }
+
+    /// Holds a response mid-way, so a test can act while a download is in flight.
+    final class Gate: @unchecked Sendable {
+        let afterBytes: Int
+        private let semaphore = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var isUsed = false
+
+        init(afterBytes: Int) {
+            self.afterBytes = afterBytes
+        }
+
+        /// Returns `true` once, for the response that should pause.
+        func claim() -> Bool {
+            lock.withLock {
+                defer { isUsed = true }
+                return !isUsed
+            }
+        }
+
+        func wait() { semaphore.wait() }
+        func open() { semaphore.signal() }
     }
 
     static let shared = StubServer()
@@ -72,13 +97,32 @@ final class StubURLProtocol: URLProtocol {
 
         let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        var offset = 0
-        while offset < body.count {
-            let end = min(offset + Self.chunkSize, body.count)
+
+        guard let gate = resource.gate, gate.claim() else {
+            send(body, from: 0)
+            return
+        }
+        let pauseAt = min(gate.afterBytes, body.count)
+        sendChunks(body, range: 0..<pauseAt)
+        let remaining = UncheckedSendable(value: (self, body))
+        DispatchQueue.global().async {
+            gate.wait()
+            remaining.value.0.send(remaining.value.1, from: pauseAt)
+        }
+    }
+
+    private func send(_ body: Data, from offset: Int) {
+        sendChunks(body, range: offset..<body.count)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    private func sendChunks(_ body: Data, range: Range<Int>) {
+        var offset = range.lowerBound
+        while offset < range.upperBound {
+            let end = min(offset + Self.chunkSize, range.upperBound)
             client?.urlProtocol(self, didLoad: body.subdata(in: offset..<end))
             offset = end
         }
-        client?.urlProtocolDidFinishLoading(self)
     }
 
     override func stopLoading() {}
@@ -90,6 +134,10 @@ final class StubURLProtocol: URLProtocol {
         let end = Int(bounds[1]).map { min($0, total - 1) } ?? total - 1
         return start <= end ? (start, end) : nil
     }
+}
+
+struct UncheckedSendable<Value>: @unchecked Sendable {
+    let value: Value
 }
 
 /// Records what the worker does with a loading request.
@@ -132,6 +180,20 @@ final class MockLoadingRequest: ResourceLoadingRequest, @unchecked Sendable {
     }
 }
 
+final class CacheFileLease: @unchecked Sendable {
+    let cache: MediaCache
+    let file: CacheFile
+
+    init(cache: MediaCache, file: CacheFile) {
+        self.cache = cache
+        self.file = file
+    }
+
+    func close() {
+        IO.sync { cache.releaseFile(file) }
+    }
+}
+
 /// Keeps a worker alive until it reports done.
 final class WorkerHolder: @unchecked Sendable {
     var worker: LoadingRequestWorker?
@@ -152,16 +214,20 @@ extension XCTestCase {
     }
 
     /// Runs one worker for `request` to completion.
-    func run(
+    func run(_ request: MockLoadingRequest, url: URL, cache: MediaCache, cancelImmediately: Bool = false) {
+        wait(for: [start(request, url: url, cache: cache, cancelImmediately: cancelImmediately)], timeout: 10)
+    }
+
+    /// Starts a worker for `request` and returns an expectation fulfilled when it's done.
+    /// Workers started from the same test method in a row begin in that order on `IO.queue`.
+    func start(
         _ request: MockLoadingRequest,
         url: URL,
         cache: MediaCache,
         cancelImmediately: Bool = false,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) {
+        holder: WorkerHolder = WorkerHolder()
+    ) -> XCTestExpectation {
         let done = expectation(description: "worker done")
-        let holder = WorkerHolder()
         IO.queue.async {
             let cacheFile = cache.openFile(for: url, fileExtension: "mp4")
             let worker = LoadingRequestWorker(
@@ -184,6 +250,24 @@ extension XCTestCase {
                 worker.cancel()
             }
         }
-        wait(for: [done], timeout: 10)
+        return done
+    }
+
+    /// Opens the cache file for `url` until `close()` is called on the result,
+    /// like a player item keeping it in use.
+    func keepOpen(_ url: URL, in cache: MediaCache) -> CacheFileLease {
+        CacheFileLease(cache: cache, file: IO.sync { cache.openFile(for: url, fileExtension: "mp4") })
+    }
+
+    /// Spins the run loop until `condition` holds on `IO.queue`, or fails after `timeout`.
+    func waitUntil(timeout: TimeInterval = 10, file: StaticString = #filePath, line: UInt = #line, _ condition: () -> Bool) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !IO.sync(condition) {
+            guard Date() < deadline else {
+                XCTFail("Condition not met within \(timeout)s", file: file, line: line)
+                return
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
     }
 }

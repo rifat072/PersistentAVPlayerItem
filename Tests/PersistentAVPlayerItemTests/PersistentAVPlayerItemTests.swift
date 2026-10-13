@@ -20,17 +20,17 @@ final class PersistentAVPlayerItemTests: XCTestCase {
     func testPlainURLInitializerUsesResourceLoader() throws {
         // Guards against resolving to the inherited `AVPlayerItem.init(url:)`, which
         // would silently bypass the cache.
-        let directoryExisted = FileManager.default.fileExists(atPath: MediaCache.defaultDirectory.path)
-        addTeardownBlock {
-            let contents = try? FileManager.default.contentsOfDirectory(atPath: MediaCache.defaultDirectory.path)
-            if !directoryExisted, contents?.isEmpty == true {
-                try? FileManager.default.removeItem(at: MediaCache.defaultDirectory)
-            }
-        }
         let url = try XCTUnwrap(URL(string: "https://\(StubServer.host)/\(UUID().uuidString).mp4"))
-        let item = PersistentAVPlayerItem(url: url)
-        XCTAssertEqual((item.asset as? AVURLAsset)?.url.scheme, "pavpi-https")
-        XCTAssertTrue(item.cache === MediaCache.shared)
+        var item: PersistentAVPlayerItem? = PersistentAVPlayerItem(url: url)
+        XCTAssertEqual((item?.asset as? AVURLAsset)?.url.scheme, "pavpi-https")
+        XCTAssertTrue(item?.cache === MediaCache.shared)
+
+        // Nothing was downloaded, so nothing may be written to the default cache
+        // (on macOS that's the user's Documents folder).
+        item = nil
+        IO.sync {}
+        let metadataURL = CacheFile.metadataURL(key: url.cacheKey, directory: MediaCache.defaultDirectory)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: metadataURL.path))
     }
 
     func testCopyKeepsCaching() throws {
@@ -63,10 +63,12 @@ final class PersistentAVPlayerItemTests: XCTestCase {
         let cache = makeTestCache()
         let body = XCTestCase.randomData(count: 20_000)
         let url = StubServer.shared.register(.init(data: body, mimeType: "audio/mpeg", supportsRange: true), name: UUID().uuidString)
-        _ = PersistentAVPlayerItem(url: url, cache: cache) // records that the extension is a guess
+        // The item that streams the file opens it with a guessed extension.
+        let streamingItem = PersistentAVPlayerItem(url: url, cache: cache)
         run(MockLoadingRequest(offset: 0, length: 20_000), url: url, cache: cache)
 
         let item = PersistentAVPlayerItem(url: url, cache: cache)
+        withExtendedLifetime(streamingItem) {}
         XCTAssertTrue(item.isPlayingFromCache)
         XCTAssertEqual((item.asset as? AVURLAsset)?.url.scheme, "pavpi-https")
     }

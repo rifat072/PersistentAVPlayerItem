@@ -44,7 +44,8 @@ public final class MediaCache: @unchecked Sendable {
     private var openFiles: [String: CacheFile] = [:]
 
     /// - Parameters:
-    ///   - directory: Where cached media is stored. Excluded from iCloud backup.
+    ///   - directory: Where cached media is stored. Created on first write and
+    ///     excluded from iCloud backup.
     ///   - memoryBufferLimit: Bytes each stream buffers in RAM before writing to disk.
     ///   - maxDiskSize: Optional size limit for the whole cache, in bytes.
     ///   - sessionConfiguration: Base configuration for downloads, e.g. to add
@@ -59,7 +60,6 @@ public final class MediaCache: @unchecked Sendable {
         self.memoryBufferLimit = memoryBufferLimit
         self.maxDiskSize = maxDiskSize
         self.fetcher = RemoteFetcher(configuration: sessionConfiguration)
-        MediaCache.prepareDirectory(directory)
     }
 
     deinit {
@@ -152,6 +152,7 @@ public final class MediaCache: @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(IO.queue))
         file.openCount -= 1
         guard file.openCount <= 0 else { return }
+        file.cancelDownloads()
         file.saveMetadata()
         file.close()
         openFiles[file.key] = nil
@@ -210,13 +211,5 @@ public final class MediaCache: @unchecked Sendable {
         for url in contents where url.deletingPathExtension().lastPathComponent == key {
             try? FileManager.default.removeItem(at: url)
         }
-    }
-
-    private static func prepareDirectory(_ directory: URL) {
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        var directory = directory
-        var values = URLResourceValues()
-        values.isExcludedFromBackup = true
-        try? directory.setResourceValues(values)
     }
 }

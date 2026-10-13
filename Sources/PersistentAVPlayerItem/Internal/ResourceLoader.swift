@@ -24,21 +24,32 @@ final class ResourceLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked 
     private var didReportCompletion: Bool
     private var lastProgressDate = Date.distantPast
 
-    init(remoteURL: URL, file: CacheFile, cache: MediaCache, eventHandler: @escaping @Sendable (Event) -> Void) {
+    /// - Parameter isComplete: Whether the file was complete when the item was
+    ///   created, read on `IO.queue`. A completion is only reported if it happens later.
+    init(remoteURL: URL, file: CacheFile, isComplete: Bool, cache: MediaCache, eventHandler: @escaping @Sendable (Event) -> Void) {
         self.remoteURL = remoteURL
         self.file = file
         self.cache = cache
         self.eventHandler = eventHandler
-        self.didReportCompletion = file.isComplete
+        self.didReportCompletion = isComplete
+        super.init()
+        // Progress comes from the file, so this item hears about bytes cached by
+        // any player of the same URL.
+        IO.queue.async { [weak self, file] in
+            guard let self else { return }
+            file.addObserver(ObjectIdentifier(self)) { [weak self] in self?.bytesCached() }
+            self.bytesCached()
+        }
     }
 
     /// Cancels all work. Called when the player item is deallocated.
     func invalidate() {
         IO.queue.async { [self] in
             isInvalidated = true
+            file.removeObserver(ObjectIdentifier(self))
             let workers = self.workers
             self.workers = []
-            for worker in workers { worker.cancel(force: true) }
+            for worker in workers { worker.cancel() }
         }
     }
 
@@ -56,7 +67,6 @@ final class ResourceLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked 
             remoteURL: remoteURL,
             memoryBufferLimit: cache.memoryBufferLimit
         )
-        worker.onBytesCached = { [weak self] in self?.bytesCached() }
         worker.onError = { [weak self] error in self?.eventHandler(.failed(error)) }
         worker.onDone = { [weak self] worker in self?.workers.removeAll { $0 === worker } }
         workers.append(worker)
@@ -71,6 +81,7 @@ final class ResourceLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked 
     // MARK: Progress
 
     private func bytesCached() {
+        guard !isInvalidated, file.cachedByteCount > 0 else { return }
         let total = file.contentLength ?? 0
         if !didReportCompletion, file.isComplete {
             didReportCompletion = true

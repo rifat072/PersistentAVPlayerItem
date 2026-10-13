@@ -79,14 +79,17 @@ final class LoadingRequestWorkerTests: XCTestCase {
     func testServerIgnoringRangeHeader() {
         let cache = makeTestCache()
         let url = register(supportsRange: false)
+        let player = keepOpen(url, in: cache)
+        defer { player.close() }
         let request = MockLoadingRequest(offset: 1_000, length: 4_000)
         run(request, url: url, cache: cache)
 
         XCTAssertEqual(request.finishCount, 1)
         XCTAssertEqual(request.receivedData, body.subdata(in: 1_000..<5_000))
         XCTAssertEqual(request.contentLength, 300_000)
-        // The full response is kept downloading so the cache fills up.
-        XCTAssertTrue(cache.isCached(url))
+        // The full response keeps downloading while the file is in use, so the cache fills up.
+        waitUntil { player.file.isComplete }
+        XCTAssertEqual(StubServer.shared.requests(for: url).count, 1)
         XCTAssertEqual(cache.cachedFileURL(for: url).flatMap { try? Data(contentsOf: $0) }, body)
     }
 

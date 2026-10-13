@@ -5,20 +5,17 @@ import Foundation
 /// Serves one loading request from AVFoundation.
 ///
 /// The requested byte range is walked from its start. Bytes already on disk are
-/// read in small chunks; each gap is fetched with an HTTP `Range` request. Bytes
-/// from the network are handed to AVFoundation immediately and collected in a
-/// small buffer, which is written to the cache file whenever it reaches
-/// `memoryBufferLimit`. RAM use per stream therefore stays at about one buffer.
+/// read in small chunks. For each gap, the worker attaches to a `SharedDownload`
+/// already fetching those bytes (for another player of the same URL, say) or
+/// starts a new one. The download, not the worker, writes the bytes to disk.
 ///
 /// Confined to `IO.queue`.
-final class LoadingRequestWorker: RemoteDataTaskHandler, @unchecked Sendable {
+final class LoadingRequestWorker: SharedDownloadSubscriber, @unchecked Sendable {
     let request: ResourceLoadingRequest
 
-    /// Called after buffered bytes were written to the cache file.
-    var onBytesCached: (() -> Void)?
     /// Called when the loading request failed with a network or server error.
     var onError: ((Error) -> Void)?
-    /// Called once, when the request has ended and no download is running any more.
+    /// Called once, when the request has finished or was cancelled.
     var onDone: ((LoadingRequestWorker) -> Void)?
 
     private let file: CacheFile
@@ -35,18 +32,8 @@ final class LoadingRequestWorker: RemoteDataTaskHandler, @unchecked Sendable {
     private var isRequestFinished = false
     private var isDone = false
 
-    private var task: URLSessionTask?
-    private var taskStartOffset: Int64 = 0
-    private var offsetAtTaskStart: Int64 = 0
-    /// Resource offset of the next byte the current task will receive.
-    private var networkOffset: Int64 = 0
-    private var serverIgnoresRange = false
-    /// Keeps downloading after the request ended, to fill the cache from a server
-    /// that ignores `Range` and so can only ever send the whole file.
-    private var isFillingWholeFile = false
-
-    private var writeBuffer = Data()
-    private var writeBufferOffset: Int64 = 0
+    private var download: SharedDownload?
+    private var offsetAtSubscribe: Int64 = 0
 
     init(
         request: ResourceLoadingRequest,
@@ -60,7 +47,7 @@ final class LoadingRequestWorker: RemoteDataTaskHandler, @unchecked Sendable {
         self.file = file
         self.fetcher = fetcher
         self.remoteURL = remoteURL
-        self.memoryBufferLimit = max(memoryBufferLimit, 16 * 1024)
+        self.memoryBufferLimit = memoryBufferLimit
         self.readChunkSize = max(readChunkSize, 16 * 1024)
     }
 
@@ -75,7 +62,7 @@ final class LoadingRequestWorker: RemoteDataTaskHandler, @unchecked Sendable {
         guard let range = request.requestedDataRange else {
             // Content information only.
             if needsContentInformation {
-                startNetworkTask(from: 0, to: 2)
+                attachOrStartDownload(from: 0, to: 2)
             } else {
                 finishRequest(error: nil)
             }
@@ -86,12 +73,12 @@ final class LoadingRequestWorker: RemoteDataTaskHandler, @unchecked Sendable {
         advance()
     }
 
-    /// AVFoundation cancelled the request, or the owning player item went away
-    /// (`force`). Never calls back into the loading request.
-    func cancel(force: Bool = false) {
+    /// AVFoundation cancelled the request, or the owning player item went away.
+    /// Never calls back into the loading request.
+    func cancel() {
         dispatchPrecondition(condition: .onQueue(IO.queue))
         isRequestFinished = true
-        requestEnded(force: force)
+        requestEnded()
     }
 
     // MARK: Serving
@@ -107,7 +94,7 @@ final class LoadingRequestWorker: RemoteDataTaskHandler, @unchecked Sendable {
             return
         }
         if needsContentInformation {
-            startNetworkTask(from: currentOffset, to: endOffset)
+            attachOrStartDownload(from: currentOffset, to: endOffset)
             return
         }
 
@@ -128,9 +115,38 @@ final class LoadingRequestWorker: RemoteDataTaskHandler, @unchecked Sendable {
             return
         }
 
-        // Fetch the gap up to the next cached range (or the end of the request).
-        let fetchEnd = [endOffset, file.ranges.nextLowerBound(after: currentOffset)].compactMap { $0 }.min()
-        startNetworkTask(from: currentOffset, to: fetchEnd)
+        // Fetch the gap up to the next cached range, the next download already
+        // under way, or the end of the request, whichever comes first.
+        let fetchEnd = [
+            endOffset,
+            file.ranges.nextLowerBound(after: currentOffset),
+            file.nextDownloadStart(after: currentOffset),
+        ].compactMap { $0 }.min()
+        attachOrStartDownload(from: currentOffset, to: fetchEnd)
+    }
+
+    /// Subscribes to a download already fetching bytes from `start`, or starts one.
+    private func attachOrStartDownload(from start: Int64, to end: Int64?) {
+        if let download = file.joinableDownload(at: start) {
+            subscribe(to: download)
+            return
+        }
+        let download = file.startDownload(
+            fetcher: fetcher,
+            remoteURL: remoteURL,
+            from: start,
+            to: end,
+            memoryBufferLimit: memoryBufferLimit
+        )
+        subscribe(to: download)
+        download.start()
+    }
+
+    private func subscribe(to download: SharedDownload) {
+        self.download = download
+        offsetAtSubscribe = currentOffset
+        // May call back right away with the response and buffered bytes.
+        download.add(self)
     }
 
     private func updateEndOffset() {
@@ -157,108 +173,40 @@ final class LoadingRequestWorker: RemoteDataTaskHandler, @unchecked Sendable {
             request.finish(error: error)
         }
         if let error { onError?(error) }
-        requestEnded(force: error != nil)
+        requestEnded()
     }
 
-    private func requestEnded(force: Bool) {
-        if task != nil {
-            if !force && (isFillingWholeFile || claimWholeFileDownload()) { return }
-            stopNetworkTask()
+    private func requestEnded() {
+        if let download {
+            self.download = nil
+            download.remove(self)
         }
-        markDone()
-    }
-
-    private func claimWholeFileDownload() -> Bool {
-        guard serverIgnoresRange, !file.isFullDownloadInProgress else { return false }
-        file.isFullDownloadInProgress = true
-        isFillingWholeFile = true
-        return true
-    }
-
-    private func markDone() {
         guard !isDone else { return }
         isDone = true
-        flushWriteBuffer()
-        file.saveMetadata()
         onDone?(self)
     }
 
-    // MARK: Network
+    // MARK: SharedDownloadSubscriber
 
-    /// Requests `[start, end)`, or everything from `start` when `end` is `nil`.
-    private func startNetworkTask(from start: Int64, to end: Int64?) {
-        var urlRequest = URLRequest(url: remoteURL)
-        let rangeEnd = end.map { String($0 - 1) } ?? ""
-        urlRequest.setValue("bytes=\(start)-\(rangeEnd)", forHTTPHeaderField: "Range")
-        taskStartOffset = start
-        offsetAtTaskStart = currentOffset
-        networkOffset = start
-        task = fetcher.startTask(with: urlRequest, handler: self)
-    }
-
-    private func stopNetworkTask() {
-        let task = self.task
-        self.task = nil
-        task?.cancel()
-        flushWriteBuffer()
-        if isFillingWholeFile {
-            isFillingWholeFile = false
-            file.isFullDownloadInProgress = false
-        }
-    }
-
-    func remoteTask(_ task: URLSessionTask, didReceive response: URLResponse) -> Bool {
-        guard task === self.task else { return false }
-        guard let response = response as? HTTPURLResponse else {
-            finishRequest(error: PersistentAVPlayerItemError.invalidResponse)
-            return false
-        }
-
-        switch response.statusCode {
-        case 206:
-            guard let contentRange = ContentRange(response.value(forHTTPHeaderField: "Content-Range")),
-                  contentRange.start == taskStartOffset else {
-                finishRequest(error: PersistentAVPlayerItemError.invalidResponse)
-                return false
-            }
-            serverIgnoresRange = false
-            file.updateContentInfo(contentLength: contentRange.total, mimeType: response.mimeType)
-        case 200:
-            // The server ignored `Range` and sends the whole file from byte 0.
-            serverIgnoresRange = true
-            networkOffset = 0
-            let length = response.expectedContentLength
-            file.updateContentInfo(contentLength: length >= 0 ? length : nil, mimeType: response.mimeType)
-        default:
-            finishRequest(error: PersistentAVPlayerItemError.unexpectedStatusCode(response.statusCode))
-            return false
-        }
-
+    func downloadDidReceiveResponse(_ download: SharedDownload) {
+        guard download === self.download, !isRequestFinished else { return }
         if needsContentInformation {
             fillContentInformation()
             needsContentInformation = false
         }
         guard request.requestedDataRange != nil else {
             finishRequest(error: nil)
-            // Still running only if it became the whole-file download.
-            return self.task != nil
+            return
         }
         updateEndOffset()
         if let endOffset, currentOffset >= endOffset {
             finishRequest(error: nil)
-            return self.task != nil
         }
-        return true
     }
 
-    func remoteTask(_ task: URLSessionTask, didReceive data: Data) {
-        guard task === self.task else { return }
-        let chunkStart = networkOffset
+    func download(_ download: SharedDownload, didReceive data: Data, at chunkStart: Int64) {
+        guard download === self.download, !isRequestFinished else { return }
         let chunkEnd = chunkStart + Int64(data.count)
-        networkOffset = chunkEnd
-        appendToWriteBuffer(data, at: chunkStart)
-
-        guard !isRequestFinished else { return }
         if chunkStart <= currentOffset, currentOffset < chunkEnd, !request.isCancelled {
             let deliverEnd = min(chunkEnd, endOffset ?? chunkEnd)
             if deliverEnd > currentOffset {
@@ -273,50 +221,21 @@ final class LoadingRequestWorker: RemoteDataTaskHandler, @unchecked Sendable {
         }
     }
 
-    func remoteTask(_ task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard task === self.task else { return }
-        self.task = nil
-        flushWriteBuffer()
-        if isFillingWholeFile {
-            isFillingWholeFile = false
-            file.isFullDownloadInProgress = false
-        }
+    func download(_ download: SharedDownload, didCompleteWithError error: Error?) {
+        guard download === self.download else { return }
+        self.download = nil
+        if isRequestFinished { return }
 
-        if isRequestFinished {
-            markDone()
-        } else if let error {
+        if let error {
             finishRequest(error: error)
         } else if endOffset == nil {
             // Length unknown: the server sent everything it has.
             finishRequest(error: nil)
-        } else if currentOffset == offsetAtTaskStart {
+        } else if currentOffset == offsetAtSubscribe {
             finishRequest(error: PersistentAVPlayerItemError.incompleteResponse)
         } else {
+            // The download's bytes are on disk now; continue from there.
             advance()
         }
-    }
-
-    // MARK: Write buffer
-
-    private func appendToWriteBuffer(_ data: Data, at offset: Int64) {
-        if !writeBuffer.isEmpty, writeBufferOffset + Int64(writeBuffer.count) != offset {
-            flushWriteBuffer()
-        }
-        if writeBuffer.isEmpty {
-            writeBufferOffset = offset
-        }
-        writeBuffer.append(data)
-        if writeBuffer.count >= memoryBufferLimit {
-            flushWriteBuffer()
-        }
-    }
-
-    private func flushWriteBuffer() {
-        guard !writeBuffer.isEmpty else { return }
-        // A failed write (e.g. disk full) only means these bytes aren't cached.
-        try? file.write(writeBuffer, at: writeBufferOffset)
-        writeBufferOffset += Int64(writeBuffer.count)
-        writeBuffer.removeAll(keepingCapacity: true)
-        onBytesCached?()
     }
 }
