@@ -8,8 +8,9 @@ struct SampleVideo: Identifiable, Hashable {
     let url: URL
 }
 
-/// Short public sample clips. All but the last support HTTP range requests; the
-/// last one comes from a server that ignores `Range`, to show that fallback.
+/// Short public sample clips. Most are MP4s from servers that support HTTP range
+/// requests; one server ignores `Range`, to show that fallback, and the last two
+/// are HLS streams.
 enum SampleVideos {
     static let all: [SampleVideo] = [
         ("Flower", "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4"),
@@ -27,6 +28,8 @@ enum SampleVideos {
         ("Pexels 2", "https://videos.pexels.com/video-files/3571264/3571264-sd_640_360_30fps.mp4"),
         ("Pexels 3", "https://videos.pexels.com/video-files/1409899/1409899-sd_640_360_25fps.mp4"),
         ("No-range server", "https://download.samplelib.com/mp4/sample-5s.mp4"),
+        ("HLS (TS)", "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"),
+        ("HLS (fMP4)", "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8"),
     ]
     .enumerated()
     .map { SampleVideo(id: $0.offset, title: $0.element.0, url: URL(string: $0.element.1)!) }

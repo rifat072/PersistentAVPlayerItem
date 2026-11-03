@@ -5,7 +5,7 @@ import PersistentAVPlayerItem
 import SwiftUI
 
 struct ContentView: View {
-    @State private var tileCount = 15
+    @State private var tileCount = SampleVideos.all.count
     /// Changing this recreates every tile, and so every player item.
     @State private var generation = 0
     @State private var cacheSize: Int64 = 0
@@ -46,7 +46,7 @@ struct ContentView: View {
 
                     Menu {
                         Picker("Videos", selection: $tileCount) {
-                            ForEach(9...15, id: \.self) { Text("\($0) videos").tag($0) }
+                            ForEach(9...SampleVideos.all.count, id: \.self) { Text("\($0) videos").tag($0) }
                         }
                         Button(role: .destructive) {
                             MediaCache.shared.clearAll()
@@ -72,7 +72,7 @@ struct ContentView: View {
 
     private var legend: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("NET – streaming; % of the file saved to disk so far")
+            Text("NET – streaming; % of the file (or HLS segments) saved to disk so far")
             Text("SAVED – fully downloaded while playing")
             Text("DISK – played from the local file, no network")
             Text("Tap ↻ to recreate the players and see cached videos load from disk.")

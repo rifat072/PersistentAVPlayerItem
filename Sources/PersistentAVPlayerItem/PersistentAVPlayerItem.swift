@@ -10,7 +10,9 @@ import AVFoundation
 ///   Cached bytes are read from disk and only the missing ranges are downloaded.
 ///   Downloaded bytes are buffered in RAM only up to `MediaCache.memoryBufferLimit`
 ///   (256 KB by default) before being written to disk.
-/// - HLS playlists (`.m3u8`) and non-HTTP URLs are played without caching.
+/// - HLS streams (`.m3u8`) play through a local HTTP server on 127.0.0.1 that
+///   caches playlists and segments the same way. Live streams aren't cached.
+/// - Non-HTTP URLs are played as-is.
 ///
 /// ```swift
 /// let item = PersistentAVPlayerItem(url: url)
@@ -33,14 +35,17 @@ open class PersistentAVPlayerItem: AVPlayerItem {
     private let customFileExtension: String?
     private let resourceLoaderDelegate: ResourceLoader?
     private let lease: CacheLease?
+    private let hlsSession: HLSSession?
 
     /// Creates an item that caches `url` in `cache`.
     ///
     /// - Parameters:
-    ///   - url: Remote URL of a progressive media file (MP4, MOV, M4A, MP3, …).
+    ///   - url: Remote URL of a progressive media file (MP4, MOV, M4A, MP3, …) or
+    ///     of an HLS playlist.
     ///   - cache: Where the media is stored. Defaults to `MediaCache.shared`.
     ///   - customFileExtension: The file's extension, for URLs whose path has none
-    ///     (for example `"mp4"`). Used to name the cached file.
+    ///     (for example `"mp4"`). Used to name the cached file. Pass `"m3u8"` for
+    ///     an HLS playlist whose URL doesn't end in `.m3u8`.
     ///   - automaticallyLoadedAssetKeys: Passed through to `AVPlayerItem`.
     public init(
         url: URL,
@@ -52,7 +57,26 @@ open class PersistentAVPlayerItem: AVPlayerItem {
         self.cache = cache
         self.customFileExtension = customFileExtension
 
-        guard url.isCacheableRemoteMedia, let customSchemeURL = url.customSchemeURL else {
+        let isHLS = url.isHLSPlaylist || ["m3u8", "m3u"].contains(customFileExtension?.lowercased())
+        if url.isRemoteHTTP, isHLS {
+            resourceLoaderDelegate = nil
+            lease = nil
+            let box = ItemBox()
+            let hls = cache.hlsProxyServer().makeSession(for: url) { event in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { box.item?.handle(event) }
+                }
+            }
+            hlsSession = hls?.session
+            isPlayingFromCache = hls?.session.isComplete ?? false
+            // Without the server, the stream still plays, just uncached.
+            super.init(asset: AVURLAsset(url: hls?.assetURL ?? url), automaticallyLoadedAssetKeys: automaticallyLoadedAssetKeys)
+            box.item = self
+            return
+        }
+
+        hlsSession = nil
+        guard url.isRemoteHTTP, let customSchemeURL = url.customSchemeURL else {
             isPlayingFromCache = false
             resourceLoaderDelegate = nil
             lease = nil
@@ -110,6 +134,7 @@ open class PersistentAVPlayerItem: AVPlayerItem {
 
     deinit {
         resourceLoaderDelegate?.invalidate()
+        hlsSession?.invalidate()
     }
 
     private func handle(_ event: ResourceLoader.Event) {

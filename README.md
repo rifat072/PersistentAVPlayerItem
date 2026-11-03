@@ -21,6 +21,7 @@ There's nothing else to set up. What happens depends on how much of the file is 
 
 ## Features
 
+- **HLS too.** `.m3u8` streams are cached playlist by playlist and segment by segment. See [HLS streams](#hls-streams).
 - **Low memory use.** Each stream holds at most `memoryBufferLimit` bytes (256 KB by default) in RAM, then writes them to a sparse file on disk. Memory use doesn't grow with file size or with the number of bytes downloaded.
 - **Range-aware.** It honors `requestedOffset`, `requestedLength` and `requestsAllDataToEndOfResource`, serves concurrent and out-of-order requests (such as the tail read for an MP4's `moov` atom), and supports seeking into parts that aren't downloaded yet without waiting for earlier bytes.
 - **One download per URL.** Players showing the same URL share in-flight downloads. A player that needs bytes another one is already fetching attaches to that download, catching up from its buffer, instead of opening a second connection. Progress and completion are reported to every item using the URL.
@@ -69,6 +70,22 @@ PersistentAVPlayerItem(url: url, customFileExtension: "mp4")
 
 Without an extension, playback still works because the type comes from the server's MIME type. The extension is only used to name the cached file so it can be played directly once complete.
 
+### HLS streams
+
+```swift
+let item = PersistentAVPlayerItem(url: URL(string: "https://example.com/stream/master.m3u8")!)
+```
+
+`AVAssetResourceLoader` can't serve HLS media segments, so HLS items play through a small HTTP server on `127.0.0.1`, started when the first HLS item is created. It rewrites each playlist so variant playlists and segments come back to it, and serves segments the same way as progressive files: from disk where cached, otherwise downloaded once (shared between players) and written to disk.
+
+- **VOD streams** (multivariant playlists, and media playlists with `#EXT-X-ENDLIST`) are cached. Every segment of a media playlist, including `EXT-X-MAP` init sections and `EXT-X-BYTERANGE` ranges, is a separate cache entry.
+- **Offline replay.** Once every segment of a variant (and of its audio rendition) is on disk, the stream counts as cached: `isPlayingFromCache` is `true`, `MediaCache.isCached(_:)` returns `true`, and the server offers only the cached variants, so playback needs no network.
+- **Live streams** play normally, and their segments aren't cached.
+- **Keys** (`EXT-X-KEY`) are never cached, so AES-128 streams still fetch their keys from the network. FairPlay works as it would without this library.
+- **Progress** counts the segments of the media playlists the player has loaded. Segment sizes are only known once downloaded, so `totalBytes` is an estimate until the last one is cached.
+- For a URL that doesn't end in `.m3u8`, pass `customFileExtension: "m3u8"`.
+- On macOS, a sandboxed app needs the `com.apple.security.network.server` entitlement for the local server. If the server can't start, the stream plays uncached.
+
 ### Managing the cache
 
 ```swift
@@ -78,7 +95,7 @@ cache.isCached(url)              // whole file on disk?
 cache.status(for: url)           // cachedBytes, totalBytes, isComplete, fractionCached
 cache.cachedFileURL(for: url)    // local file, once complete
 cache.totalSize                  // bytes on disk
-cache.remove(url)
+cache.remove(url)                // for HLS, every playlist and segment of the stream
 cache.clearAll()
 ```
 
@@ -111,11 +128,11 @@ The library keeps its own memory small. Most of the remaining memory goes to AVF
 
 ## Demo
 
-`Example/PersistentAVPlayerItemDemo.xcodeproj` is a SwiftUI app that plays 9–15 muted, looping videos in a grid. Each tile's badge shows its cache state:
+`Example/PersistentAVPlayerItemDemo.xcodeproj` is a SwiftUI app that plays 9–17 muted, looping videos in a grid, including two HLS streams. Each tile's badge shows its cache state:
 
 | Badge | Meaning |
 | --- | --- |
-| **NET n%** | Streaming; n% of the file is saved so far. |
+| **NET n%** | Streaming; n% of the file (or of the HLS segments loaded) is saved so far. |
 | **SAVED** | Fully downloaded while playing. |
 | **DISK** | Played from the local file with no network. |
 
@@ -123,7 +140,7 @@ Tap ↻ to recreate the players and watch cached videos switch to **DISK**. The 
 
 ## Limitations
 
-- Only progressive files (MP4, MOV, M4A, MP3, …) are cached. HLS (`.m3u8`) and non-HTTP URLs play normally without caching.
+- Progressive files and VOD HLS streams are cached. Live HLS, MPEG-DASH and non-HTTP URLs play normally without caching.
 - Media is cached only as far as AVPlayer requests it. A video is fully cached once it has been played (or buffered) to the end.
 - If the remote file's length changes, its cached bytes are discarded and fetched again.
 
@@ -133,7 +150,7 @@ Tap ↻ to recreate the players and watch cached videos switch to **DISK**. The 
 swift test
 ```
 
-The unit tests drive the range and caching logic against a stub HTTP server, both with and without `Range` support.
+The unit tests drive the range and caching logic against a stub HTTP server, both with and without `Range` support, and drive the HLS server over real loopback HTTP.
 
 ## License
 

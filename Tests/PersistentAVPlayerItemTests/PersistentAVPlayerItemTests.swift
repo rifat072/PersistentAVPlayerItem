@@ -73,11 +73,21 @@ final class PersistentAVPlayerItemTests: XCTestCase {
         XCTAssertEqual((item.asset as? AVURLAsset)?.url.scheme, "pavpi-https")
     }
 
-    func testHLSAndFileURLsPassThrough() throws {
+    func testHLSItemPlaysThroughLocalServer() throws {
         let hls = try XCTUnwrap(URL(string: "https://example.com/stream/master.m3u8"))
         let hlsItem = PersistentAVPlayerItem(url: hls, cache: makeTestCache())
-        XCTAssertEqual((hlsItem.asset as? AVURLAsset)?.url, hls)
+        let assetURL = try XCTUnwrap((hlsItem.asset as? AVURLAsset)?.url)
+        XCTAssertEqual(assetURL.scheme, "http")
+        XCTAssertEqual(assetURL.host, "127.0.0.1")
+        XCTAssertEqual(assetURL.lastPathComponent, "master.m3u8")
+        XCTAssertFalse(hlsItem.isPlayingFromCache)
 
+        let extensionless = try XCTUnwrap(URL(string: "https://example.com/stream/master"))
+        let extensionlessItem = PersistentAVPlayerItem(url: extensionless, cache: makeTestCache(), customFileExtension: "m3u8")
+        XCTAssertEqual((extensionlessItem.asset as? AVURLAsset)?.url.host, "127.0.0.1")
+    }
+
+    func testFileURLsPassThrough() throws {
         let file = URL(fileURLWithPath: "/tmp/clip.mp4")
         let fileItem = PersistentAVPlayerItem(url: file, cache: makeTestCache())
         XCTAssertEqual((fileItem.asset as? AVURLAsset)?.url, file)

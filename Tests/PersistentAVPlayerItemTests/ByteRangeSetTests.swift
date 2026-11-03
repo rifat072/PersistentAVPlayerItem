@@ -92,8 +92,12 @@ final class ParsingTests: XCTestCase {
     }
 
     func testCacheability() throws {
-        XCTAssertTrue(try XCTUnwrap(URL(string: "https://example.com/a.mp4")).isCacheableRemoteMedia)
-        XCTAssertFalse(try XCTUnwrap(URL(string: "https://example.com/a.m3u8")).isCacheableRemoteMedia)
-        XCTAssertFalse(URL(fileURLWithPath: "/tmp/a.mp4").isCacheableRemoteMedia)
+        let mp4 = try XCTUnwrap(URL(string: "https://example.com/a.mp4"))
+        let hls = try XCTUnwrap(URL(string: "https://example.com/a.M3U8"))
+        XCTAssertTrue(mp4.isRemoteHTTP)
+        XCTAssertFalse(mp4.isHLSPlaylist)
+        XCTAssertTrue(hls.isRemoteHTTP)
+        XCTAssertTrue(hls.isHLSPlaylist)
+        XCTAssertFalse(URL(fileURLWithPath: "/tmp/a.mp4").isRemoteHTTP)
     }
 }

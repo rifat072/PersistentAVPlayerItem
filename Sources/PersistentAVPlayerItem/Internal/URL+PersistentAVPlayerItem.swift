@@ -6,12 +6,16 @@ import Foundation
 extension URL {
     static let customSchemePrefix = "pavpi-"
 
-    /// Whether the URL points at a single progressive file that can be cached.
-    /// HLS playlists and local files are played as-is.
-    var isCacheableRemoteMedia: Bool {
-        guard let scheme = scheme?.lowercased(), scheme == "http" || scheme == "https" else { return false }
+    /// Whether the URL can be cached at all. Local files are played as-is.
+    var isRemoteHTTP: Bool {
+        guard let scheme = scheme?.lowercased() else { return false }
+        return scheme == "http" || scheme == "https"
+    }
+
+    /// Whether the URL names an HLS playlist by its extension.
+    var isHLSPlaylist: Bool {
         let ext = pathExtension.lowercased()
-        return ext != "m3u8" && ext != "m3u"
+        return ext == "m3u8" || ext == "m3u"
     }
 
     /// The URL with its scheme replaced, so AVFoundation hands every request for

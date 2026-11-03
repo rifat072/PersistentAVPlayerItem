@@ -6,7 +6,8 @@ import Foundation
 ///
 /// Each remote URL is stored as a sparse data file plus a small JSON file that
 /// records which byte ranges have been downloaded, so partially played media
-/// resumes from disk and only the missing bytes are fetched.
+/// resumes from disk and only the missing bytes are fetched. An HLS stream is
+/// stored as one such entry per playlist and per segment.
 public final class MediaCache: @unchecked Sendable {
     /// The cache used by `PersistentAVPlayerItem` unless another one is passed in.
     public static let shared = MediaCache()
@@ -42,6 +43,8 @@ public final class MediaCache: @unchecked Sendable {
     let fetcher: RemoteFetcher
     /// Open cache files by key. Confined to `IO.queue`.
     private var openFiles: [String: CacheFile] = [:]
+    /// Created on first use by an HLS item. Confined to `IO.queue`.
+    private var hlsServer: HLSProxyServer?
 
     /// - Parameters:
     ///   - directory: Where cached media is stored. Created on first write and
@@ -64,19 +67,28 @@ public final class MediaCache: @unchecked Sendable {
 
     deinit {
         fetcher.invalidate()
+        if let hlsServer {
+            IO.queue.async { hlsServer.stop() }
+        }
     }
 
     // MARK: Public API
 
-    /// Whether the whole resource at `url` is stored on disk.
+    /// Whether the whole resource at `url` is stored on disk. For an HLS stream,
+    /// whether at least one variant (with its audio) can play without network.
     public func isCached(_ url: URL) -> Bool {
         status(for: url).isComplete
     }
 
+    /// For an HLS stream, `cachedBytes` counts all of its playlists and segments
+    /// on disk, and `totalBytes` is only known once the stream is complete.
     public func status(for url: URL) -> Status {
         IO.sync {
             guard let metadata = metadata(for: url) else {
                 return Status(cachedBytes: 0, totalBytes: nil, isComplete: false)
+            }
+            if metadata.isHLSPlaylist {
+                return hlsStatus(for: url)
             }
             let cached = metadata.ranges.byteCount
             let isComplete = metadata.contentLength.map { $0 > 0 && metadata.ranges.contains(0..<$0) } ?? false
@@ -84,12 +96,11 @@ public final class MediaCache: @unchecked Sendable {
         }
     }
 
-    /// The local file for `url`, only once it is completely downloaded.
+    /// The local file for `url`, only once it is completely downloaded. Always
+    /// `nil` for HLS streams, which are stored as many files.
     public func cachedFileURL(for url: URL) -> URL? {
         IO.sync {
-            guard let metadata = metadata(for: url),
-                  let length = metadata.contentLength, length > 0,
-                  metadata.ranges.contains(0..<length) else { return nil }
+            guard let metadata = metadata(for: url), metadata.isComplete, !metadata.isHLSPlaylist else { return nil }
             return directory.appendingPathComponent(metadata.fileName, isDirectory: false)
         }
     }
@@ -101,15 +112,13 @@ public final class MediaCache: @unchecked Sendable {
         }
     }
 
-    /// Deletes the cached data for `url`. Data in use by a player item is
-    /// truncated instead, and the item keeps streaming from the network.
+    /// Deletes the cached data for `url`, including every playlist and segment
+    /// of an HLS stream. Data in use by a player item is truncated instead, and
+    /// the item keeps streaming from the network.
     public func remove(_ url: URL) {
         IO.sync {
-            let key = url.cacheKey
-            if let file = openFiles[key] {
-                file.reset()
-            } else {
-                deleteEntry(key: key)
+            for url in [url] + hlsDescendants(of: url) {
+                removeEntry(for: url)
             }
         }
     }
@@ -148,6 +157,16 @@ public final class MediaCache: @unchecked Sendable {
         return file
     }
 
+    /// The HLS server, started if needed. Must not be called on `IO.queue`.
+    func hlsProxyServer() -> HLSProxyServer {
+        IO.sync {
+            if let hlsServer { return hlsServer }
+            let server = HLSProxyServer(cache: self)
+            hlsServer = server
+            return server
+        }
+    }
+
     func releaseFile(_ file: CacheFile) {
         dispatchPrecondition(condition: .onQueue(IO.queue))
         file.openCount -= 1
@@ -165,6 +184,10 @@ public final class MediaCache: @unchecked Sendable {
         var entries = entries()
         var total = entries.reduce(0) { $0 + $1.size }
         guard total > maxDiskSize else { return }
+        // Read access dates only now: an HLS stream adds an entry per segment.
+        for index in entries.indices {
+            entries[index].lastAccess = CacheFile.loadMetadata(key: entries[index].key, directory: directory)?.lastAccess ?? .distantPast
+        }
         entries.sort { $0.lastAccess < $1.lastAccess }
         for entry in entries where total > maxDiskSize && openFiles[entry.key] == nil {
             deleteEntry(key: entry.key)
@@ -180,7 +203,9 @@ public final class MediaCache: @unchecked Sendable {
         var lastAccess: Date
     }
 
-    private func metadata(for url: URL) -> CacheFile.Metadata? {
+    /// The metadata of the entry for `url`, from the open file or from disk.
+    func metadata(for url: URL) -> CacheFile.Metadata? {
+        dispatchPrecondition(condition: .onQueue(IO.queue))
         let key = url.cacheKey
         if let file = openFiles[key] { return file.metadata }
         guard let metadata = CacheFile.loadMetadata(key: key, directory: directory),
@@ -196,14 +221,18 @@ public final class MediaCache: @unchecked Sendable {
             let key = url.deletingPathExtension().lastPathComponent
             let values = try? url.resourceValues(forKeys: Set(keys))
             let size = Int64(values?.totalFileAllocatedSize ?? values?.fileAllocatedSize ?? 0)
-            var entry = entries[key] ?? Entry(key: key, size: 0, lastAccess: .distantPast)
-            entry.size += size
-            if url.pathExtension == "json", let metadata = CacheFile.loadMetadata(key: key, directory: directory) {
-                entry.lastAccess = metadata.lastAccess
-            }
-            entries[key] = entry
+            entries[key, default: Entry(key: key, size: 0, lastAccess: .distantPast)].size += size
         }
         return Array(entries.values)
+    }
+
+    private func removeEntry(for url: URL) {
+        let key = url.cacheKey
+        if let file = openFiles[key] {
+            file.reset()
+        } else {
+            deleteEntry(key: key)
+        }
     }
 
     private func deleteEntry(key: String) {

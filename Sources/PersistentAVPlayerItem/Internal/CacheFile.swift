@@ -17,6 +17,14 @@ final class CacheFile: @unchecked Sendable {
         var mimeType: String?
         var ranges: ByteRangeSet
         var lastAccess: Date
+        /// For an HLS playlist, its URL after redirects, which relative URIs
+        /// in it resolve against.
+        var resolvedURL: URL?
+
+        var isComplete: Bool {
+            guard let contentLength, contentLength > 0 else { return false }
+            return ranges.contains(0..<contentLength)
+        }
     }
 
     /// Metadata is persisted after at least this many new bytes, and whenever a
@@ -76,10 +84,7 @@ final class CacheFile: @unchecked Sendable {
     var fileExtension: String { (metadata.fileName as NSString).pathExtension }
     var cachedByteCount: Int64 { metadata.ranges.byteCount }
 
-    var isComplete: Bool {
-        guard let length = metadata.contentLength, length > 0 else { return false }
-        return metadata.ranges.contains(0..<length)
-    }
+    var isComplete: Bool { metadata.isComplete }
 
     /// Records the resource's length and MIME type. A changed length means the
     /// remote file changed, so the stale bytes are discarded.
@@ -107,6 +112,15 @@ final class CacheFile: @unchecked Sendable {
         if unsavedByteCount >= CacheFile.metadataSaveThreshold {
             saveMetadata()
         }
+    }
+
+    /// Replaces the whole resource, e.g. a playlist downloaded in one piece.
+    func replaceContents(with data: Data, mimeType: String?, resolvedURL: URL?) throws {
+        reset()
+        updateContentInfo(contentLength: Int64(data.count), mimeType: mimeType)
+        metadata.resolvedURL = resolvedURL
+        try write(data, at: 0)
+        saveMetadata()
     }
 
     func read(at offset: Int64, length: Int) throws -> Data {
