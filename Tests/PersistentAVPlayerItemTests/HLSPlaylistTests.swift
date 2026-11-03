@@ -76,6 +76,30 @@ final class HLSPlaylistTests: XCTestCase {
         XCTAssertFalse(playlist.isFinal)
     }
 
+    func testRewriteListsPreferredVariantsFirst() throws {
+        let playlist = try playlist("""
+        #EXTM3U
+        #EXT-X-INDEPENDENT-SEGMENTS
+        #EXT-X-STREAM-INF:BANDWIDTH=800000
+        low.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=2000000
+        high.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=5000000
+        top.m3u8
+        """)
+        let text = playlist.rewritten(listFirst: { $0.url.lastPathComponent == "high.m3u8" }) { _ in .keep }
+        XCTAssertEqual(text, """
+        #EXTM3U
+        #EXT-X-INDEPENDENT-SEGMENTS
+        #EXT-X-STREAM-INF:BANDWIDTH=2000000
+        https://cdn.test/videos/clip/high.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=800000
+        https://cdn.test/videos/clip/low.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=5000000
+        https://cdn.test/videos/clip/top.m3u8
+        """)
+    }
+
     func testRewriteReplacesAndDrops() throws {
         let playlist = try playlist("""
         #EXTM3U

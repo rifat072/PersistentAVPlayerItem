@@ -10,11 +10,12 @@ final class HLSProxyServerTests: XCTestCase {
         var master: URL
         var low: URL
         var high: URL
+        var highSegment: URL
         var segments: [URL]
         var segmentData: [Data]
     }
 
-    /// A VOD stream with two variants; the low one has three TS segments.
+    /// A VOD stream with two variants: low with three TS segments, high with one.
     private func registerStream(live: Bool = false) -> Stream {
         let directory = "hls-\(UUID().uuidString)"
         let segmentData = (0..<3).map { XCTestCase.randomData(count: 20_000 + $0 * 1000) }
@@ -33,6 +34,7 @@ final class HLSProxyServerTests: XCTestCase {
         \(live ? "" : "#EXT-X-ENDLIST")
         """
         let low = StubServer.shared.register(.init(data: Data(media.utf8), mimeType: "application/vnd.apple.mpegurl", supportsRange: false), name: "\(directory)/low/index.m3u8")
+        let highSegment = StubServer.shared.register(.init(data: XCTestCase.randomData(count: 30_000), mimeType: "video/mp2t", supportsRange: true), name: "\(directory)/high/seg0.ts")
         let highMedia = "#EXTM3U\n#EXTINF:4.0,\nseg0.ts\n#EXT-X-ENDLIST\n"
         let high = StubServer.shared.register(.init(data: Data(highMedia.utf8), mimeType: "application/vnd.apple.mpegurl", supportsRange: false), name: "\(directory)/high/index.m3u8")
         let master = """
@@ -43,7 +45,7 @@ final class HLSProxyServerTests: XCTestCase {
         high/index.m3u8
         """
         let masterURL = StubServer.shared.register(.init(data: Data(master.utf8), mimeType: "application/vnd.apple.mpegurl", supportsRange: false), name: "\(directory)/master.m3u8")
-        return Stream(master: masterURL, low: low, high: high, segments: segments, segmentData: segmentData)
+        return Stream(master: masterURL, low: low, high: high, highSegment: highSegment, segments: segments, segmentData: segmentData)
     }
 
     private let client: URLSession = {
@@ -110,7 +112,7 @@ final class HLSProxyServerTests: XCTestCase {
     }
 
     func testCompleteStreamPlaysFromDiskWithOnlyCachedVariants() async throws {
-        let cache = makeTestCache()
+        let cache = makeTestCache(hlsVariantPolicy: .preferCached)
         let stream = registerStream()
         let (_, masterURL) = try await makeSession(cache, url: stream.master)
         let variants = try uriLines(try await get(masterURL).0)
@@ -132,6 +134,35 @@ final class HLSProxyServerTests: XCTestCase {
         }
         let requestsAfter = ([stream.master, stream.low] + stream.segments).map { StubServer.shared.requests(for: $0).count }
         XCTAssertEqual(requestsAfter, requestsBefore, "A cached stream must not touch the network")
+    }
+
+    func testCachedStreamCanUpgradeWhileOnline() async throws {
+        let cache = makeTestCache()
+        let stream = registerStream()
+        let (_, masterURL) = try await makeSession(cache, url: stream.master)
+        let server = cache.hlsProxyServer()
+        IO.sync { server.isOnlineOverride = true }
+
+        // Cache the second-listed (high) variant.
+        let variants = try uriLines(try await get(masterURL).0)
+        for url in try uriLines(try await get(variants[1]).0) {
+            _ = try await get(url)
+        }
+        waitUntil { cache.isHLSComplete(stream.master) }
+
+        // Online: every variant, the cached one first.
+        let (session, secondURL) = try await makeSession(cache, url: stream.master)
+        XCTAssertTrue(session.isComplete)
+        let online = try uriLines(try await get(secondURL).0)
+        XCTAssertEqual(online.count, 2)
+        XCTAssertTrue(try XCTUnwrap(online.first).absoluteString.hasSuffix("/index.m3u8"))
+        let firstMedia = try uriLines(try await get(online[0]).0)
+        XCTAssertEqual(firstMedia.count, 1, "The cached high variant should be listed first")
+
+        // Offline: only the cached variant.
+        IO.sync { server.isOnlineOverride = false }
+        let offline = try uriLines(try await get(secondURL).0)
+        XCTAssertEqual(offline, [online[0]])
     }
 
     func testLiveSegmentsArePassedThrough() async throws {

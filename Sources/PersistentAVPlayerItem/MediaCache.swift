@@ -19,6 +19,17 @@ public final class MediaCache: @unchecked Sendable {
         return documents.appendingPathComponent("PersistentAVPlayerItem", isDirectory: true)
     }
 
+    /// Which variants of a cached HLS stream are offered to the player.
+    public enum HLSVariantPolicy: Sendable {
+        /// While online, every variant is offered, cached ones first: playback
+        /// starts from disk, and the player may switch to a better variant,
+        /// which is then cached too. Offline, only cached variants are offered.
+        case upgradeWhenOnline
+        /// Once a variant is fully cached, only cached variants are offered,
+        /// online or not, so a cached stream never uses the network.
+        case preferCached
+    }
+
     public struct Status: Equatable, Sendable {
         /// Bytes of the resource stored on disk.
         public var cachedBytes: Int64
@@ -39,6 +50,7 @@ public final class MediaCache: @unchecked Sendable {
     /// When set, least recently used entries are deleted once the cache grows past
     /// this size. Entries in use by a player item are never deleted.
     public let maxDiskSize: Int64?
+    public let hlsVariantPolicy: HLSVariantPolicy
 
     let fetcher: RemoteFetcher
     /// Open cache files by key. Confined to `IO.queue`.
@@ -51,17 +63,21 @@ public final class MediaCache: @unchecked Sendable {
     ///     excluded from iCloud backup.
     ///   - memoryBufferLimit: Bytes each stream buffers in RAM before writing to disk.
     ///   - maxDiskSize: Optional size limit for the whole cache, in bytes.
+    ///   - hlsVariantPolicy: Whether a cached HLS stream may switch to variants
+    ///     that aren't cached yet.
     ///   - sessionConfiguration: Base configuration for downloads, e.g. to add
     ///     `httpAdditionalHeaders`. Its `urlCache` is disabled.
     public init(
         directory: URL = MediaCache.defaultDirectory,
         memoryBufferLimit: Int = 256 * 1024,
         maxDiskSize: Int64? = nil,
+        hlsVariantPolicy: HLSVariantPolicy = .upgradeWhenOnline,
         sessionConfiguration: URLSessionConfiguration = .default
     ) {
         self.directory = directory
         self.memoryBufferLimit = memoryBufferLimit
         self.maxDiskSize = maxDiskSize
+        self.hlsVariantPolicy = hlsVariantPolicy
         self.fetcher = RemoteFetcher(configuration: sessionConfiguration)
     }
 

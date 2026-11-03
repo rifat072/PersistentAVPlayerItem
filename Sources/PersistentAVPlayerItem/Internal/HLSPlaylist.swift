@@ -72,9 +72,15 @@ struct HLSPlaylist {
     }
 
     /// The playlist with every URI made absolute and passed through `transform`.
-    func rewritten(_ transform: (Reference) -> Rewrite) -> String {
+    /// Variant streams for which `listFirst` returns `true` are moved ahead of
+    /// the others, since players usually start with the first one listed.
+    func rewritten(listFirst: (Reference) -> Bool = { _ in false }, _ transform: (Reference) -> Rewrite) -> String {
         let isMultivariant = isMultivariant
         var lines: [String] = []
+        // Variant streams (`EXT-X-STREAM-INF` plus URI), reinserted in order at
+        // the position of the first one.
+        var variantBlocks: [(listFirst: Bool, lines: [String])] = []
+        var variantsIndex: Int?
         // The `EXT-X-STREAM-INF` line waiting for its URI line.
         var pendingStreamInfo: String?
         // `EXT-X-BYTERANGE` of the next segment.
@@ -142,14 +148,22 @@ struct HLSPlaylist {
             if let streamInfo {
                 reference.audioGroup = Self.attribute("AUDIO", in: streamInfo)
             }
+            let uri: String
             switch transform(reference) {
-            case .keep:
-                lines.append(contentsOf: [streamInfo, url.absoluteString].compactMap { $0 })
-            case let .replace(newURL):
-                lines.append(contentsOf: [streamInfo, newURL.absoluteString].compactMap { $0 })
-            case .drop:
-                break
+            case .keep: uri = url.absoluteString
+            case let .replace(newURL): uri = newURL.absoluteString
+            case .drop: continue
             }
+            if let streamInfo, reference.kind == .variant {
+                variantsIndex = variantsIndex ?? lines.count
+                variantBlocks.append((listFirst(reference), [streamInfo, uri]))
+            } else {
+                lines.append(contentsOf: [streamInfo, uri].compactMap { $0 })
+            }
+        }
+        if let variantsIndex {
+            let ordered = variantBlocks.filter(\.listFirst) + variantBlocks.filter { !$0.listFirst }
+            lines.insert(contentsOf: ordered.flatMap(\.lines), at: variantsIndex)
         }
         return lines.joined(separator: "\n")
     }

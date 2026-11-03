@@ -32,10 +32,20 @@ final class HLSProxyServer: @unchecked Sendable {
     private var connections: [ObjectIdentifier: HLSProxyConnection] = [:]
     private var sessions: [Int: HLSSession] = [:]
     private var nextSessionID = 1
+    private let pathMonitor = NWPathMonitor()
+    private var hasNetwork = true
+    /// Replaces the network state, for tests.
+    var isOnlineOverride: Bool?
 
     init(cache: MediaCache) {
         self.cache = cache
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            self?.hasNetwork = path.status == .satisfied
+        }
+        pathMonitor.start(queue: IO.queue)
     }
+
+    private var isOnline: Bool { isOnlineOverride ?? hasNetwork }
 
     // MARK: Sessions
 
@@ -70,6 +80,7 @@ final class HLSProxyServer: @unchecked Sendable {
     func stop() {
         dispatchPrecondition(condition: .onQueue(IO.queue))
         isStopped = true
+        pathMonitor.cancel()
         listener?.cancel()
         listener = nil
         isReady = false
@@ -244,20 +255,22 @@ final class HLSProxyServer: @unchecked Sendable {
             Self.proxyURL(for: reference.url, kind: kind, sessionID: sessionID, port: port).map { .replace($0) } ?? .keep
         }
 
-        // Once a variant can play entirely from disk, offer only those, so the
-        // player doesn't switch to one that needs the network.
-        var offlineVariants: Set<URL>?
+        // Variants that can play entirely from disk are listed first, so playback
+        // starts from disk. When the player mustn't switch to one that needs the
+        // network (offline, or by policy), they're the only ones offered.
+        var cachedVariants: Set<URL> = []
+        var offersOnlyCachedVariants = false
         if playlist.isMultivariant {
             let playable = cache.playableVariants(of: playlist)
-            if playable.contains(where: { $0.kind == .variant }) {
-                offlineVariants = Set(playable.map(\.url))
-            }
+            cachedVariants = Set(playable.map(\.url))
+            offersOnlyCachedVariants = playable.contains { $0.kind == .variant }
+                && (cache.hlsVariantPolicy == .preferCached || !isOnline)
         }
 
-        let text = playlist.rewritten { reference in
+        let text = playlist.rewritten(listFirst: { cachedVariants.contains($0.url) }) { reference in
             switch reference.kind {
             case .variant, .iFrameVariant:
-                if let offlineVariants, !offlineVariants.contains(reference.url) { return .drop }
+                if offersOnlyCachedVariants, !cachedVariants.contains(reference.url) { return .drop }
                 return proxied(reference, as: .playlist)
             case .rendition:
                 return proxied(reference, as: .playlist)

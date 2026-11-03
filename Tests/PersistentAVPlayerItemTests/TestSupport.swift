@@ -200,13 +200,22 @@ final class WorkerHolder: @unchecked Sendable {
 }
 
 extension XCTestCase {
-    func makeTestCache(memoryBufferLimit: Int = 16 * 1024, directory: URL? = nil) -> MediaCache {
+    func makeTestCache(
+        memoryBufferLimit: Int = 16 * 1024,
+        directory: URL? = nil,
+        hlsVariantPolicy: MediaCache.HLSVariantPolicy = .upgradeWhenOnline
+    ) -> MediaCache {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StubURLProtocol.self]
         let directory = directory ?? FileManager.default.temporaryDirectory
             .appendingPathComponent("PersistentAVPlayerItemTests-\(UUID().uuidString)", isDirectory: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
-        return MediaCache(directory: directory, memoryBufferLimit: memoryBufferLimit, sessionConfiguration: configuration)
+        return MediaCache(
+            directory: directory,
+            memoryBufferLimit: memoryBufferLimit,
+            hlsVariantPolicy: hlsVariantPolicy,
+            sessionConfiguration: configuration
+        )
     }
 
     static func randomData(count: Int) -> Data {

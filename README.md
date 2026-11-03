@@ -79,7 +79,8 @@ let item = PersistentAVPlayerItem(url: URL(string: "https://example.com/stream/m
 `AVAssetResourceLoader` can't serve HLS media segments, so HLS items play through a small HTTP server on `127.0.0.1`, started when the first HLS item is created. It rewrites each playlist so variant playlists and segments come back to it, and serves segments the same way as progressive files: from disk where cached, otherwise downloaded once (shared between players) and written to disk.
 
 - **VOD streams** (multivariant playlists, and media playlists with `#EXT-X-ENDLIST`) are cached. Every segment of a media playlist, including `EXT-X-MAP` init sections and `EXT-X-BYTERANGE` ranges, is a separate cache entry.
-- **Offline replay.** Once every segment of a variant (and of its audio rendition) is on disk, the stream counts as cached: `isPlayingFromCache` is `true`, `MediaCache.isCached(_:)` returns `true`, and the server offers only the cached variants, so playback needs no network.
+- **Replay from disk.** Once every segment of a variant (and of its audio rendition) is on disk, the stream counts as cached: `isPlayingFromCache` is `true` and `MediaCache.isCached(_:)` returns `true`. The server lists cached variants first, so playback starts from disk.
+- **Upgrading quality.** With the default `hlsVariantPolicy: .upgradeWhenOnline`, the uncached variants are still offered while the device is online. If the player switches to a better one, it's cached too. Offline, only cached variants are offered, so playback doesn't stall on a variant that needs the network. Pass `.preferCached` to `MediaCache(…)` to offer only cached variants even when online, so a cached stream never uses the network.
 - **Live streams** play normally, and their segments aren't cached.
 - **Keys** (`EXT-X-KEY`) are never cached, so AES-128 streams still fetch their keys from the network. FairPlay works as it would without this library.
 - **Progress** counts the segments of the media playlists the player has loaded. Segment sizes are only known once downloaded, so `totalBytes` is an estimate until the last one is cached.
@@ -109,6 +110,7 @@ let cache = MediaCache(
     directory: MediaCache.defaultDirectory,
     memoryBufferLimit: 256 * 1024,
     maxDiskSize: 500 * 1024 * 1024,      // evicts least recently used entries
+    hlsVariantPolicy: .upgradeWhenOnline,
     sessionConfiguration: configuration
 )
 let item = PersistentAVPlayerItem(url: url, cache: cache)
